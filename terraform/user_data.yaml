@@ -1,0 +1,137 @@
+#cloud-config
+# WireGuard server bootstrap for Amazon Linux 2023 (ARM64).
+# Rendered by Terraform templatefile(); the only template variable is ${wg_port}.
+
+package_update: true
+
+packages:
+  - wireguard-tools
+  - qrencode
+  - iptables-nft
+
+write_files:
+  - path: /etc/sysctl.d/99-wireguard.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      net.ipv4.ip_forward = 1
+
+  # Rewrites the Endpoint host in client.conf with the instance's current
+  # public IP (fetched via IMDSv2), then prints the config and a QR code.
+  # Runs at every boot (systemd unit below) and on demand via start.sh/SSM,
+  # because the public IP changes across stop/start cycles.
+  - path: /usr/local/bin/wg-refresh-endpoint.sh
+    owner: root:root
+    permissions: "0700"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      CONF=/etc/wireguard/client.conf
+      if [ ! -f "$CONF" ]; then
+        echo "client.conf not generated yet; skipping endpoint refresh"
+        exit 0
+      fi
+      TOKEN=$(curl -sf -X PUT http://169.254.169.254/latest/api/token \
+        -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+      PUBLIC_IP=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" \
+        http://169.254.169.254/latest/meta-data/public-ipv4)
+      sed -i -E "s|^Endpoint = .*:|Endpoint = $PUBLIC_IP:|" "$CONF"
+      echo "===== WIREGUARD CLIENT CONFIG (import into the WireGuard app) ====="
+      cat "$CONF"
+      echo "===== QR CODE (scan with the WireGuard mobile app) ====="
+      qrencode -t ansiutf8 < "$CONF"
+      echo "===== END WIREGUARD CLIENT CONFIG ====="
+
+  - path: /etc/systemd/system/wg-endpoint-refresh.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Refresh WireGuard client endpoint with current public IP
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/wg-refresh-endpoint.sh
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # First-boot setup: keys, server config, client config, service.
+  # Idempotent: existing keys and wg0.conf are never regenerated.
+  - path: /usr/local/bin/wg-setup.sh
+    owner: root:root
+    permissions: "0700"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+
+      WG_PORT="${wg_port}"
+      WG_DIR=/etc/wireguard
+
+      umask 077
+      mkdir -p "$WG_DIR"
+
+      # --- Key generation (idempotent) ---
+      if [ ! -f "$WG_DIR/server_private.key" ]; then
+        wg genkey | tee "$WG_DIR/server_private.key" | wg pubkey > "$WG_DIR/server_public.key"
+      fi
+      if [ ! -f "$WG_DIR/client_private.key" ]; then
+        wg genkey | tee "$WG_DIR/client_private.key" | wg pubkey > "$WG_DIR/client_public.key"
+      fi
+
+      SERVER_PRIV=$(cat "$WG_DIR/server_private.key")
+      SERVER_PUB=$(cat "$WG_DIR/server_public.key")
+      CLIENT_PRIV=$(cat "$WG_DIR/client_private.key")
+      CLIENT_PUB=$(cat "$WG_DIR/client_public.key")
+
+      # Default route interface for NAT masquerade
+      IFACE=$(ip route show default | awk '{print $5; exit}')
+
+      # --- Server config (idempotent) ---
+      if [ ! -f "$WG_DIR/wg0.conf" ]; then
+        cat > "$WG_DIR/wg0.conf" <<EOF
+      [Interface]
+      Address = 10.66.66.1/24
+      ListenPort = $WG_PORT
+      PrivateKey = $SERVER_PRIV
+      MTU = 1420
+      PostUp = iptables -t nat -A POSTROUTING -s 10.66.66.0/24 -o $IFACE -j MASQUERADE; iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -j ACCEPT
+      PostDown = iptables -t nat -D POSTROUTING -s 10.66.66.0/24 -o $IFACE -j MASQUERADE; iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT
+
+      [Peer]
+      PublicKey = $CLIENT_PUB
+      AllowedIPs = 10.66.66.2/32
+      EOF
+      fi
+
+      # --- Client config (idempotent; endpoint host is filled in by
+      #     wg-refresh-endpoint.sh, so a placeholder is fine here) ---
+      if [ ! -f "$WG_DIR/client.conf" ]; then
+        cat > "$WG_DIR/client.conf" <<EOF
+      [Interface]
+      PrivateKey = $CLIENT_PRIV
+      Address = 10.66.66.2/32
+      DNS = 1.1.1.1
+      MTU = 1420
+
+      [Peer]
+      PublicKey = $SERVER_PUB
+      Endpoint = 0.0.0.0:$WG_PORT
+      AllowedIPs = 0.0.0.0/0
+      PersistentKeepalive = 25
+      EOF
+      fi
+
+      systemctl enable --now wg-quick@wg0
+
+      # Fill in the real public IP and print config + QR to the cloud-init
+      # log / console (retrievable via 'aws ec2 get-console-output').
+      /usr/local/bin/wg-refresh-endpoint.sh
+
+runcmd:
+  - [sysctl, --system]
+  - [systemctl, daemon-reload]
+  - [systemctl, enable, wg-endpoint-refresh.service]
+  - [/usr/local/bin/wg-setup.sh]

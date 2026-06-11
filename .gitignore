@@ -1,0 +1,16 @@
+# Terraform state contains resource IDs and can contain secrets — never commit
+*.tfstate
+*.tfstate.*
+**/.terraform/
+crash.log
+
+# Local variable overrides
+*.tfvars
+*.tfvars.json
+
+# WireGuard client configs contain private keys
+*.conf
+
+# macOS
+.DS_Store
+
